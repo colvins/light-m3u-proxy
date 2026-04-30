@@ -1,0 +1,11 @@
+channels.m3u
+docker-compose.yml
+docker-compose.override.yml
+*.bak*
+*.key
+*.pem
+*.crt
+*.cer
+.env
+.env.*
+.DS_Store

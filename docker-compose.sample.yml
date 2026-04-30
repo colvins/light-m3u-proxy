@@ -1,0 +1,12 @@
+services:
+  light-m3u-proxy:
+    build: .
+    container_name: light-m3u-proxy
+    restart: unless-stopped
+    ports:
+      - "5050:8080"
+    environment:
+      PUBLIC_BASE_URL: "http://example.com:5050"
+      PORT: "8080"
+    volumes:
+      - ./channels.m3u:/app/channels.m3u:ro
