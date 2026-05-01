@@ -121,7 +121,10 @@ func playlistHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("playlist read error: %v", err)
 	}
 
-	writeM3U8Response(w, r, http.StatusOK, body.String())
+	result := body.String()
+	result = strings.ReplaceAll(result, "\r\n", "\n")
+	result = strings.ReplaceAll(result, "\r", "\n")
+	writePlaylistResponse(w, r, http.StatusOK, result)
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -616,6 +619,22 @@ func setM3U8Headers(h http.Header) {
 	h.Set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8")
 	h.Del("Accept-Ranges")
 	h.Del("Content-Range")
+}
+
+func setPlaylistHeaders(h http.Header) {
+	setCommonHeaders(h)
+	h.Set("Content-Type", "audio/x-mpegurl; charset=utf-8")
+	h.Del("Accept-Ranges")
+	h.Del("Content-Range")
+}
+
+func writePlaylistResponse(w http.ResponseWriter, r *http.Request, status int, body string) {
+	setPlaylistHeaders(w.Header())
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = io.WriteString(w, body)
+	}
 }
 
 func writeM3U8Response(w http.ResponseWriter, r *http.Request, status int, body string) {
