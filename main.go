@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -100,29 +102,26 @@ func playlistHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	setM3U8Headers(w.Header())
-	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, maxPlaylistBytes)
 	baseURL := requestBaseURL(r)
+	var body strings.Builder
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if isHTTPURL(line) {
-			fmt.Fprintln(w, proxyURL(baseURL, line))
+			fmt.Fprintln(&body, proxyURL(baseURL, line))
 			continue
 		}
-		fmt.Fprintln(w, scanner.Text())
+		fmt.Fprintln(&body, scanner.Text())
 	}
 
 	if err := scanner.Err(); err != nil {
 		log.Printf("playlist read error: %v", err)
 	}
+
+	writeM3U8Response(w, r, http.StatusOK, body.String())
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -206,14 +205,6 @@ type m3u8Result struct {
 }
 
 func serveM3U8(w http.ResponseWriter, r *http.Request, resp *http.Response, finalURL *url.URL, contentType string, start time.Time) {
-	if r.Method == http.MethodHead {
-		copyResponseHeaders(w.Header(), resp.Header, false)
-		setM3U8Headers(w.Header())
-		w.WriteHeader(resp.StatusCode)
-		log.Printf("proxy m3u8 summary client_method=%s final_url=%s final_status=%d content-type=%q m3u8_rewrite=false rewrite_lines=0 flattened=false head_only=true", r.Method, logURL(finalURL), resp.StatusCode, contentType)
-		return
-	}
-
 	body, err := readLimitedText(resp.Body)
 	if err != nil {
 		log.Printf("m3u8 read error url=%s err=%v", logURL(finalURL), err)
@@ -232,9 +223,7 @@ func serveM3U8(w http.ResponseWriter, r *http.Request, resp *http.Response, fina
 	}
 
 	copyResponseHeaders(w.Header(), result.headers, false)
-	setM3U8Headers(w.Header())
-	w.WriteHeader(result.status)
-	_, _ = io.WriteString(w, result.body)
+	writeM3U8Response(w, r, result.status, result.body)
 
 	if result.flattenErr != "" {
 		log.Printf("proxy flatten summary flattened=false flatten_error=%q original_url=%s", truncateLog(result.flattenErr), logURL(finalURL))
@@ -392,6 +381,10 @@ func rewriteM3U8(body string, base *url.URL, requestBase string) (string, int) {
 
 	lines := strings.Split(body, "\n")
 	rewrittenLines := 0
+	maxTargetDuration := 0
+	targetDurationIndex := -1
+	versionIndex := -1
+	m3uIndex := -1
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
@@ -401,6 +394,27 @@ func rewriteM3U8(body string, base *url.URL, requestBase string) (string, int) {
 
 		if strings.HasPrefix(trimmed, "#") {
 			lines[i] = trimmed
+			switch {
+			case strings.HasPrefix(trimmed, "#EXTINF:"):
+				if duration, ok := parseEXTINFDuration(trimmed); ok {
+					targetDuration := int(math.Ceil(duration))
+					if targetDuration > maxTargetDuration {
+						maxTargetDuration = targetDuration
+					}
+				}
+			case strings.HasPrefix(trimmed, "#EXT-X-TARGETDURATION:"):
+				if targetDurationIndex == -1 {
+					targetDurationIndex = i
+				}
+			case strings.HasPrefix(trimmed, "#EXT-X-VERSION:"):
+				if versionIndex == -1 {
+					versionIndex = i
+				}
+			case trimmed == "#EXTM3U":
+				if m3uIndex == -1 {
+					m3uIndex = i
+				}
+			}
 			continue
 		}
 
@@ -411,7 +425,50 @@ func rewriteM3U8(body string, base *url.URL, requestBase string) (string, int) {
 			lines[i] = trimmed
 		}
 	}
+
+	lines = fixTargetDuration(lines, maxTargetDuration, targetDurationIndex, versionIndex, m3uIndex)
 	return strings.Join(lines, "\n"), rewrittenLines
+}
+
+func parseEXTINFDuration(line string) (float64, bool) {
+	value := strings.TrimPrefix(line, "#EXTINF:")
+	if comma := strings.Index(value, ","); comma >= 0 {
+		value = value[:comma]
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || duration <= 0 {
+		return 0, false
+	}
+	return duration, true
+}
+
+func fixTargetDuration(lines []string, maxTargetDuration, targetDurationIndex, versionIndex, m3uIndex int) []string {
+	if maxTargetDuration <= 0 {
+		return lines
+	}
+
+	targetLine := fmt.Sprintf("#EXT-X-TARGETDURATION:%d", maxTargetDuration)
+	if targetDurationIndex >= 0 {
+		currentValue := strings.TrimSpace(strings.TrimPrefix(lines[targetDurationIndex], "#EXT-X-TARGETDURATION:"))
+		currentTargetDuration, err := strconv.Atoi(currentValue)
+		if err != nil || currentTargetDuration < maxTargetDuration {
+			lines[targetDurationIndex] = targetLine
+		}
+		return lines
+	}
+
+	insertAfter := m3uIndex
+	if versionIndex >= 0 {
+		insertAfter = versionIndex
+	}
+	if insertAfter < 0 {
+		return append([]string{targetLine}, lines...)
+	}
+
+	lines = append(lines, "")
+	copy(lines[insertAfter+2:], lines[insertAfter+1:])
+	lines[insertAfter+1] = targetLine
+	return lines
 }
 
 func singleVariantURI(body string) (string, bool) {
@@ -557,6 +614,17 @@ func setCommonHeaders(h http.Header) {
 func setM3U8Headers(h http.Header) {
 	setCommonHeaders(h)
 	h.Set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8")
+	h.Del("Accept-Ranges")
+	h.Del("Content-Range")
+}
+
+func writeM3U8Response(w http.ResponseWriter, r *http.Request, status int, body string) {
+	setM3U8Headers(w.Header())
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = io.WriteString(w, body)
+	}
 }
 
 func setBinaryHeaders(h http.Header, target *url.URL, upstreamContentType string) {
