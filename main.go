@@ -121,10 +121,7 @@ func playlistHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("playlist read error: %v", err)
 	}
 
-	result := body.String()
-	result = strings.ReplaceAll(result, "\r\n", "\n")
-	result = strings.ReplaceAll(result, "\r", "\n")
-	writePlaylistResponse(w, r, http.StatusOK, result)
+	writePlaylistResponse(w, r, http.StatusOK, normalizeLineEndings(body.String()))
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -379,8 +376,7 @@ func isRedirectStatus(status int) bool {
 }
 
 func rewriteM3U8(body string, base *url.URL, requestBase string) (string, int) {
-	body = strings.ReplaceAll(body, "\r\n", "\n")
-	body = strings.ReplaceAll(body, "\r", "\n")
+	body = normalizeLineEndings(body)
 
 	lines := strings.Split(body, "\n")
 	rewrittenLines := 0
@@ -431,6 +427,11 @@ func rewriteM3U8(body string, base *url.URL, requestBase string) (string, int) {
 
 	lines = fixTargetDuration(lines, maxTargetDuration, targetDurationIndex, versionIndex, m3uIndex)
 	return strings.Join(lines, "\n"), rewrittenLines
+}
+
+func normalizeLineEndings(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	return strings.ReplaceAll(value, "\r", "\n")
 }
 
 func parseEXTINFDuration(line string) (float64, bool) {
@@ -614,36 +615,28 @@ func setCommonHeaders(h http.Header) {
 	h.Set("Access-Control-Allow-Headers", "*")
 }
 
-func setM3U8Headers(h http.Header) {
+func setTextHeaders(h http.Header, contentType string) {
 	setCommonHeaders(h)
-	h.Set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8")
+	h.Set("Content-Type", contentType)
 	h.Del("Accept-Ranges")
 	h.Del("Content-Range")
 }
 
-func setPlaylistHeaders(h http.Header) {
-	setCommonHeaders(h)
-	h.Set("Content-Type", "audio/x-mpegurl; charset=utf-8")
-	h.Del("Accept-Ranges")
-	h.Del("Content-Range")
+func writeTextResponse(w http.ResponseWriter, r *http.Request, status int, body, contentType string) {
+	setTextHeaders(w.Header(), contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = io.WriteString(w, body)
+	}
 }
 
 func writePlaylistResponse(w http.ResponseWriter, r *http.Request, status int, body string) {
-	setPlaylistHeaders(w.Header())
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(status)
-	if r.Method != http.MethodHead {
-		_, _ = io.WriteString(w, body)
-	}
+	writeTextResponse(w, r, status, body, "audio/x-mpegurl; charset=utf-8")
 }
 
 func writeM3U8Response(w http.ResponseWriter, r *http.Request, status int, body string) {
-	setM3U8Headers(w.Header())
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(status)
-	if r.Method != http.MethodHead {
-		_, _ = io.WriteString(w, body)
-	}
+	writeTextResponse(w, r, status, body, "application/vnd.apple.mpegurl; charset=utf-8")
 }
 
 func setBinaryHeaders(h http.Header, target *url.URL, upstreamContentType string) {
