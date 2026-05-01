@@ -387,21 +387,28 @@ func isRedirectStatus(status int) bool {
 }
 
 func rewriteM3U8(body string, base *url.URL, requestBase string) (string, int) {
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	body = strings.ReplaceAll(body, "\r", "\n")
+
 	lines := strings.Split(body, "\n")
 	rewrittenLines := 0
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
+			lines[i] = ""
 			continue
 		}
 
 		if strings.HasPrefix(trimmed, "#") {
+			lines[i] = trimmed
 			continue
 		}
 
 		if resolved, ok := resolvePlaylistURL(trimmed, base); ok {
 			lines[i] = proxyURL(requestBase, resolved)
 			rewrittenLines++
+		} else {
+			lines[i] = trimmed
 		}
 	}
 	return strings.Join(lines, "\n"), rewrittenLines
@@ -426,7 +433,7 @@ func singleVariantURI(body string) (string, bool) {
 		uris = append(uris, trimmed)
 	}
 
-	if hasStreamInf && len(uris) == 1 {
+	if hasStreamInf && len(uris) >= 1 {
 		return uris[0], true
 	}
 	return "", false
