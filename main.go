@@ -21,7 +21,7 @@ const (
 	channelsFile        = "channels.m3u"
 	maxPlaylistBytes    = 10 << 20
 	maxRedirects        = 5
-	upstreamUserAgent   = "light-m3u-proxy/0.1"
+	upstreamUserAgent   = "lztv"
 	copyBufferSize      = 32 << 10
 	maxLogURLLength     = 180
 	playlistContentType = "audio/x-mpegurl; charset=utf-8"
@@ -165,9 +165,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	upstreamContentType := resp.Header.Get("Content-Type")
-	isTS := isTSURL(finalURL)
 	logRedirectChain(r.Method, redirects)
-	log.Printf("proxy final client_method=%s upstream_method=GET final_url=%s final_status=%d content-type=%q redirects=%d is_ts=%t", r.Method, logURL(finalURL), resp.StatusCode, upstreamContentType, len(redirects), isTS)
+	log.Printf("proxy final client_method=%s upstream_method=GET final_url=%s final_status=%d content-type=%q redirects=%d", r.Method, logURL(finalURL), resp.StatusCode, upstreamContentType, len(redirects))
 
 	if isM3U8(finalURL, upstreamContentType) {
 		serveM3U8(w, r, resp, finalURL, upstreamContentType, start)
@@ -178,7 +177,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	setBinaryHeaders(w.Header(), finalURL, upstreamContentType)
 	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
-		log.Printf("proxy binary client_method=%s upstream_method=GET final_url=%s status=%d is_ts=%t returned_content_type=%q head_only=true", r.Method, logURL(finalURL), resp.StatusCode, isTS, w.Header().Get("Content-Type"))
+		log.Printf("proxy binary client_method=%s upstream_method=GET final_url=%s status=%d content-type=%q head_only=true", r.Method, logURL(finalURL), resp.StatusCode, w.Header().Get("Content-Type"))
 		return
 	}
 
@@ -187,22 +186,13 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("stream copy error status=%d bytes=%d duration=%s url=%s err=%v", resp.StatusCode, n, time.Since(start).Round(time.Millisecond), logURL(finalURL), err)
 		return
 	}
-	log.Printf("proxy binary client_method=%s upstream_method=GET final_url=%s status=%d is_ts=%t returned_content_type=%q bytes=%d duration=%s", r.Method, logURL(finalURL), resp.StatusCode, isTS, w.Header().Get("Content-Type"), n, time.Since(start).Round(time.Millisecond))
+	log.Printf("proxy binary client_method=%s upstream_method=GET final_url=%s status=%d content-type=%q bytes=%d duration=%s", r.Method, logURL(finalURL), resp.StatusCode, w.Header().Get("Content-Type"), n, time.Since(start).Round(time.Millisecond))
 }
 
 type redirectHop struct {
 	From   *url.URL
 	To     *url.URL
 	Status int
-}
-
-type m3u8Result struct {
-	body        string
-	lines       int
-	status      int
-	headers     http.Header
-	finalURL    *url.URL
-	contentType string
 }
 
 func serveM3U8(w http.ResponseWriter, r *http.Request, resp *http.Response, finalURL *url.URL, contentType string, start time.Time) {
@@ -213,12 +203,12 @@ func serveM3U8(w http.ResponseWriter, r *http.Request, resp *http.Response, fina
 	}
 
 	baseURL := requestBaseURL(r)
-	result := rewritePlaylist(body, finalURL, baseURL, resp.StatusCode, resp.Header, contentType)
+	rewritten, lines := rewriteM3U8(body, finalURL, baseURL)
 
-	copyResponseHeaders(w.Header(), result.headers, false)
-	writeM3U8Response(w, r, result.status, result.body)
+	copyResponseHeaders(w.Header(), resp.Header, false)
+	writeM3U8Response(w, r, resp.StatusCode, rewritten)
 
-	log.Printf("proxy m3u8 rewrite summary client_method=%s final_url=%s status=%d content-type=%q m3u8_rewrite=true rewrite_lines=%d bytes=%d duration=%s", r.Method, logURL(result.finalURL), result.status, result.contentType, result.lines, len(result.body), time.Since(start).Round(time.Millisecond))
+	log.Printf("proxy m3u8 rewrite summary client_method=%s final_url=%s status=%d content-type=%q m3u8_rewrite=true rewrite_lines=%d bytes=%d duration=%s", r.Method, logURL(finalURL), resp.StatusCode, contentType, lines, len(rewritten), time.Since(start).Round(time.Millisecond))
 }
 
 func readLimitedText(r io.Reader) (string, error) {
@@ -230,18 +220,6 @@ func readLimitedText(r io.Reader) (string, error) {
 		return "", errors.New("m3u8 too large")
 	}
 	return string(body), nil
-}
-
-func rewritePlaylist(body string, base *url.URL, requestBase string, status int, headers http.Header, contentType string) m3u8Result {
-	rewritten, lines := rewriteM3U8(body, base, requestBase)
-	return m3u8Result{
-		body:        rewritten,
-		lines:       lines,
-		status:      status,
-		headers:     headers,
-		finalURL:    base,
-		contentType: contentType,
-	}
 }
 
 func fetchUpstream(r *http.Request, target *url.URL) (*http.Response, *url.URL, []redirectHop, error) {
