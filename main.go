@@ -57,7 +57,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	log.Printf("light-m3u-proxy listening on :%s, public base url: %s", port, publicBaseURL)
+	log.Printf("light-m3u-proxy listening on :%s, fallback public base url: %s", port, publicBaseURL)
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -109,11 +109,12 @@ func playlistHandler(w http.ResponseWriter, r *http.Request) {
 	scanner := bufio.NewScanner(file)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, maxPlaylistBytes)
+	baseURL := requestBaseURL(r)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if isHTTPURL(line) {
-			fmt.Fprintln(w, proxyURL(line))
+			fmt.Fprintln(w, proxyURL(baseURL, line))
 			continue
 		}
 		fmt.Fprintln(w, scanner.Text())
@@ -219,9 +220,10 @@ func serveM3U8(w http.ResponseWriter, r *http.Request, resp *http.Response, fina
 		return
 	}
 
-	result := rewritePlaylist(body, finalURL, resp.StatusCode, resp.Header, contentType)
+	baseURL := requestBaseURL(r)
+	result := rewritePlaylist(body, finalURL, baseURL, resp.StatusCode, resp.Header, contentType)
 	if childURI, ok := singleVariantURI(body); ok {
-		if flattened, err := flattenVariantPlaylist(r, childURI, finalURL); err != nil {
+		if flattened, err := flattenVariantPlaylist(r, childURI, finalURL, baseURL); err != nil {
 			result.flattenErr = err.Error()
 		} else {
 			result = flattened
@@ -240,7 +242,7 @@ func serveM3U8(w http.ResponseWriter, r *http.Request, resp *http.Response, fina
 	log.Printf("proxy m3u8 rewrite summary client_method=%s final_url=%s final_status=%d content-type=%q m3u8_rewrite=true rewrite_lines=%d flattened=%t bytes=%d duration=%s", r.Method, logURL(result.finalURL), result.status, result.contentType, result.lines, result.flattened, len(result.body), time.Since(start).Round(time.Millisecond))
 }
 
-func flattenVariantPlaylist(r *http.Request, childRaw string, base *url.URL) (m3u8Result, error) {
+func flattenVariantPlaylist(r *http.Request, childRaw string, base *url.URL, requestBase string) (m3u8Result, error) {
 	childResolved, ok := resolvePlaylistURL(childRaw, base)
 	if !ok {
 		return m3u8Result{}, errors.New("variant child url is not http/https")
@@ -266,7 +268,7 @@ func flattenVariantPlaylist(r *http.Request, childRaw string, base *url.URL) (m3
 	if err != nil {
 		return m3u8Result{}, err
 	}
-	return rewritePlaylist(body, childFinalURL, childResp.StatusCode, childResp.Header, childContentType), nil
+	return rewritePlaylist(body, childFinalURL, requestBase, childResp.StatusCode, childResp.Header, childContentType), nil
 }
 
 func readLimitedText(r io.Reader) (string, error) {
@@ -280,8 +282,8 @@ func readLimitedText(r io.Reader) (string, error) {
 	return string(body), nil
 }
 
-func rewritePlaylist(body string, base *url.URL, status int, headers http.Header, contentType string) m3u8Result {
-	rewritten, lines := rewriteM3U8(body, base)
+func rewritePlaylist(body string, base *url.URL, requestBase string, status int, headers http.Header, contentType string) m3u8Result {
+	rewritten, lines := rewriteM3U8(body, base, requestBase)
 	return m3u8Result{
 		body:        rewritten,
 		lines:       lines,
@@ -384,7 +386,7 @@ func isRedirectStatus(status int) bool {
 	}
 }
 
-func rewriteM3U8(body string, base *url.URL) (string, int) {
+func rewriteM3U8(body string, base *url.URL, requestBase string) (string, int) {
 	lines := strings.Split(body, "\n")
 	rewrittenLines := 0
 	for i, line := range lines {
@@ -398,7 +400,7 @@ func rewriteM3U8(body string, base *url.URL) (string, int) {
 		}
 
 		if resolved, ok := resolvePlaylistURL(trimmed, base); ok {
-			lines[i] = proxyURL(resolved)
+			lines[i] = proxyURL(requestBase, resolved)
 			rewrittenLines++
 		}
 	}
@@ -447,8 +449,60 @@ func resolvePlaylistURL(raw string, base *url.URL) (string, bool) {
 	return base.ResolveReference(u).String(), true
 }
 
-func proxyURL(raw string) string {
-	return publicBaseURL + "/proxy?url=" + url.QueryEscape(raw)
+func proxyURL(baseURL, raw string) string {
+	return baseURL + "/proxy?url=" + url.QueryEscape(raw)
+}
+
+func requestBaseURL(r *http.Request) string {
+	scheme := firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))
+	if scheme == "" {
+		if r.TLS != nil {
+			scheme = "https"
+		} else {
+			scheme = "http"
+		}
+	}
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if scheme != "http" && scheme != "https" {
+		return publicBaseURL
+	}
+
+	host := firstForwardedValue(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(r.Host)
+	}
+	if host == "" {
+		return publicBaseURL
+	}
+
+	if !hostHasPort(host) {
+		if port := firstForwardedValue(r.Header.Get("X-Forwarded-Port")); port != "" {
+			host = net.JoinHostPort(strings.Trim(host, "[]"), port)
+		}
+	}
+
+	return scheme + "://" + host
+}
+
+func firstForwardedValue(value string) string {
+	if value == "" {
+		return ""
+	}
+	value = strings.Split(value, ",")[0]
+	return strings.TrimSpace(value)
+}
+
+func hostHasPort(host string) bool {
+	if strings.TrimSpace(host) == "" {
+		return false
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return true
+	}
+	if strings.Count(host, ":") == 1 && strings.LastIndex(host, ":") > 0 {
+		return true
+	}
+	return false
 }
 
 func isHTTPURL(line string) bool {
