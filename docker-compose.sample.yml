@@ -10,3 +10,8 @@ services:
       PORT: "8080"
     volumes:
       - ./channels.m3u:/app/channels.m3u:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
